@@ -1,4 +1,4 @@
-"""TaskFlow v1 — single-module FastAPI app."""
+"""TaskFlow v2 — 7 breaking changes from v1 (see v2/README.md)."""
 from datetime import datetime, timedelta
 from enum import Enum
 from typing import Dict, List, Optional
@@ -16,24 +16,23 @@ TOKEN_EXPIRE_MINUTES = 30
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer()
-app = FastAPI(title="TaskFlow", version="1.0.0")
+app = FastAPI(title="TaskFlow", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=["http://localhost:5174"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-class TaskStatus(str, Enum):
-    PENDING = "pending"
-    IN_PROGRESS = "in_progress"
-    COMPLETED = "completed"
-    CANCELLED = "cancelled"
+# CHANGE 7: status values renamed (pending→open, completed→done)
+class ItemStatus(str, Enum):
+    OPEN = "open"
+    DONE = "done"
 
 
-class TaskPriority(str, Enum):
+class ItemPriority(str, Enum):
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
@@ -62,28 +61,41 @@ class TokenResponse(BaseModel):
     token_type: str = "bearer"
 
 
-class TaskCreate(BaseModel):
+class ItemCreate(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     description: Optional[str] = None
-    priority: TaskPriority = TaskPriority.MEDIUM
+    priority: ItemPriority = ItemPriority.MEDIUM
 
 
-class TaskUpdate(BaseModel):
+class ItemUpdate(BaseModel):
     title: Optional[str] = None
     description: Optional[str] = None
-    status: Optional[TaskStatus] = None
-    priority: Optional[TaskPriority] = None
+    status: Optional[ItemStatus] = None
+    priority: Optional[ItemPriority] = None
 
 
-class TaskResponse(BaseModel):
+class ItemResponse(BaseModel):
     id: int
     user_id: int
     title: str
     description: Optional[str]
-    status: TaskStatus
-    priority: TaskPriority
+    status: ItemStatus
+    priority: ItemPriority
     created_at: datetime
     updated_at: datetime
+
+
+class ItemRecord:
+    def __init__(self, id: int, user_id: int, title: str, description: Optional[str], priority: ItemPriority):
+        self.id = id
+        self.user_id = user_id
+        self.title = title
+        self.description = description
+        self.status = ItemStatus.OPEN
+        self.priority = priority
+        self.archived = False
+        self.created_at = datetime.utcnow()
+        self.updated_at = datetime.utcnow()
 
 
 class UserRecord:
@@ -95,30 +107,18 @@ class UserRecord:
         self.created_at = datetime.utcnow()
 
 
-class TaskRecord:
-    def __init__(self, id: int, user_id: int, title: str, description: Optional[str], priority: TaskPriority):
-        self.id = id
-        self.user_id = user_id
-        self.title = title
-        self.description = description
-        self.status = TaskStatus.PENDING
-        self.priority = priority
-        self.created_at = datetime.utcnow()
-        self.updated_at = datetime.utcnow()
-
-
 class Database:
     def __init__(self):
         self.users: Dict[int, UserRecord] = {}
-        self.tasks: Dict[int, TaskRecord] = {}
+        self.items: Dict[int, ItemRecord] = {}
         self.emails: Dict[str, int] = {}
-        self._uid = self._tid = 1
+        self._uid = self._iid = 1
 
     def reset(self):
         self.users.clear()
-        self.tasks.clear()
+        self.items.clear()
         self.emails.clear()
-        self._uid = self._tid = 1
+        self._uid = self._iid = 1
 
     def create_user(self, email: str, username: str, hashed: str) -> UserRecord:
         user = UserRecord(self._uid, email, username, hashed)
@@ -134,25 +134,30 @@ class Database:
     def get_user(self, uid: int) -> Optional[UserRecord]:
         return self.users.get(uid)
 
-    def create_task(self, user_id: int, title: str, description: Optional[str], priority: TaskPriority) -> TaskRecord:
-        task = TaskRecord(self._tid, user_id, title, description, priority)
-        self.tasks[self._tid] = task
-        self._tid += 1
-        return task
+    def create_item(self, user_id: int, title: str, description: Optional[str], priority: ItemPriority) -> ItemRecord:
+        item = ItemRecord(self._iid, user_id, title, description, priority)
+        self.items[self._iid] = item
+        self._iid += 1
+        return item
 
-    def get_task(self, tid: int) -> Optional[TaskRecord]:
-        return self.tasks.get(tid)
+    def get_item(self, iid: int) -> Optional[ItemRecord]:
+        return self.items.get(iid)
 
-    def user_tasks(self, user_id: int) -> List[TaskRecord]:
-        return [t for t in self.tasks.values() if t.user_id == user_id]
+    def user_items(self, user_id: int) -> List[ItemRecord]:
+        return [i for i in self.items.values() if i.user_id == user_id and not i.archived]
 
-    def save_task(self, task: TaskRecord) -> TaskRecord:
-        task.updated_at = datetime.utcnow()
-        self.tasks[task.id] = task
-        return task
+    def save_item(self, item: ItemRecord) -> ItemRecord:
+        item.updated_at = datetime.utcnow()
+        self.items[item.id] = item
+        return item
 
-    def delete_task(self, tid: int) -> bool:
-        return self.tasks.pop(tid, None) is not None
+    def archive_item(self, iid: int) -> bool:
+        item = self.items.get(iid)
+        if not item:
+            return False
+        item.archived = True
+        item.updated_at = datetime.utcnow()
+        return True
 
 
 db = Database()
@@ -193,46 +198,40 @@ def authenticate_user(email: str, password: str) -> Optional[UserRecord]:
     return user
 
 
-def validate_status_change(current: TaskStatus, new: TaskStatus) -> None:
-    if current == TaskStatus.COMPLETED and new != TaskStatus.COMPLETED:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Cannot reopen completed task")
-    if current == TaskStatus.CANCELLED:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Cannot change cancelled task")
-
-
-def filter_tasks(tasks: List[TaskRecord], status: Optional[TaskStatus], search: Optional[str]) -> List[TaskRecord]:
-    result = tasks
+def filter_items(items: List[ItemRecord], status: Optional[ItemStatus], search: Optional[str]) -> List[ItemRecord]:
+    result = items
     if status:
-        result = [t for t in result if t.status == status]
+        result = [i for i in result if i.status == status]
     if search:
         q = search.lower()
-        result = [t for t in result if q in t.title.lower() or (t.description and q in t.description.lower())]
-    return sorted(result, key=lambda t: t.created_at, reverse=True)
+        result = [i for i in result if q in i.title.lower() or (i.description and q in i.description.lower())]
+    return sorted(result, key=lambda i: i.created_at, reverse=True)
 
 
-def task_stats(user_id: int) -> dict:
-    tasks = db.user_tasks(user_id)
+# CHANGE 4: stats keys renamed (pending→open, completed→done)
+def item_stats(user_id: int) -> dict:
+    items = db.user_items(user_id)
     return {
-        "total": len(tasks),
-        "pending": sum(1 for t in tasks if t.status == TaskStatus.PENDING),
-        "completed": sum(1 for t in tasks if t.status == TaskStatus.COMPLETED),
-        "high_priority": sum(1 for t in tasks if t.priority == TaskPriority.HIGH),
+        "total": len(items),
+        "open": sum(1 for i in items if i.status == ItemStatus.OPEN),
+        "done": sum(1 for i in items if i.status == ItemStatus.DONE),
+        "high_priority": sum(1 for i in items if i.priority == ItemPriority.HIGH),
     }
 
 
-def to_task_response(task: TaskRecord) -> TaskResponse:
-    return TaskResponse(
-        id=task.id, user_id=task.user_id, title=task.title, description=task.description,
-        status=task.status, priority=task.priority, created_at=task.created_at, updated_at=task.updated_at,
+def to_item_response(item: ItemRecord) -> ItemResponse:
+    return ItemResponse(
+        id=item.id, user_id=item.user_id, title=item.title, description=item.description,
+        status=item.status, priority=item.priority, created_at=item.created_at, updated_at=item.updated_at,
     )
 
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "version": "1.0.0"}
+    return {"status": "healthy", "version": "2.0.0"}
 
 
-@app.post("/api/v1/auth/register", response_model=UserResponse, status_code=201)
+@app.post("/api/v2/auth/register", response_model=UserResponse, status_code=201)
 def register(data: UserCreate):
     if db.get_user_by_email(data.email.lower()):
         raise HTTPException(status.HTTP_409_CONFLICT, "Email already registered")
@@ -240,7 +239,7 @@ def register(data: UserCreate):
     return UserResponse(id=user.id, email=user.email, username=user.username, created_at=user.created_at)
 
 
-@app.post("/api/v1/auth/login", response_model=TokenResponse)
+@app.post("/api/v2/auth/login", response_model=TokenResponse)
 def login(data: UserLogin):
     user = authenticate_user(data.email.lower(), data.password)
     if not user:
@@ -248,65 +247,68 @@ def login(data: UserLogin):
     return TokenResponse(access_token=create_access_token(user.id, user.email))
 
 
-@app.get("/api/v1/users/me", response_model=UserResponse)
+# CHANGE 3: profile moved from /users/me to /auth/me
+@app.get("/api/v2/auth/me", response_model=UserResponse)
 def get_profile(user: UserRecord = Depends(get_current_user)):
     return UserResponse(id=user.id, email=user.email, username=user.username, created_at=user.created_at)
 
 
-@app.post("/api/v1/tasks", response_model=TaskResponse, status_code=201)
-def create_task(data: TaskCreate, user: UserRecord = Depends(get_current_user)):
-    task = db.create_task(user.id, data.title.strip(), data.description, data.priority)
-    return to_task_response(task)
+# CHANGE 2: tasks renamed to items
+@app.post("/api/v2/items", response_model=ItemResponse, status_code=201)
+def create_item(data: ItemCreate, user: UserRecord = Depends(get_current_user)):
+    item = db.create_item(user.id, data.title.strip(), data.description, data.priority)
+    return to_item_response(item)
 
 
-@app.get("/api/v1/tasks", response_model=List[TaskResponse])
-def list_tasks(
-    status_filter: Optional[TaskStatus] = Query(None, alias="status"),
+@app.get("/api/v2/items", response_model=List[ItemResponse])
+def list_items(
+    status_filter: Optional[ItemStatus] = Query(None, alias="status"),
     search: Optional[str] = Query(None),
     user: UserRecord = Depends(get_current_user),
 ):
-    return [to_task_response(t) for t in filter_tasks(db.user_tasks(user.id), status_filter, search)]
+    return [to_item_response(i) for i in filter_items(db.user_items(user.id), status_filter, search)]
 
 
-@app.get("/api/v1/tasks/stats")
+@app.get("/api/v2/items/stats")
 def stats(user: UserRecord = Depends(get_current_user)):
-    return task_stats(user.id)
+    return item_stats(user.id)
 
 
-@app.get("/api/v1/tasks/{task_id}", response_model=TaskResponse)
-def get_task(task_id: int, user: UserRecord = Depends(get_current_user)):
-    task = db.get_task(task_id)
-    if not task:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Task not found")
-    if task.user_id != user.id:
+@app.get("/api/v2/items/{item_id}", response_model=ItemResponse)
+def get_item(item_id: int, user: UserRecord = Depends(get_current_user)):
+    item = db.get_item(item_id)
+    if not item or item.archived:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Item not found")
+    if item.user_id != user.id:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Forbidden")
-    return to_task_response(task)
+    return to_item_response(item)
 
 
-@app.put("/api/v1/tasks/{task_id}", response_model=TaskResponse)
-def update_task(task_id: int, data: TaskUpdate, user: UserRecord = Depends(get_current_user)):
-    task = db.get_task(task_id)
-    if not task:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Task not found")
-    if task.user_id != user.id:
+# CHANGE 6: PUT replaced with PATCH
+@app.patch("/api/v2/items/{item_id}", response_model=ItemResponse)
+def update_item(item_id: int, data: ItemUpdate, user: UserRecord = Depends(get_current_user)):
+    item = db.get_item(item_id)
+    if not item or item.archived:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Item not found")
+    if item.user_id != user.id:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Forbidden")
     if data.title is not None:
-        task.title = data.title.strip()
+        item.title = data.title.strip()
     if data.description is not None:
-        task.description = data.description
+        item.description = data.description
     if data.priority is not None:
-        task.priority = data.priority
+        item.priority = data.priority
     if data.status is not None:
-        validate_status_change(task.status, data.status)
-        task.status = data.status
-    return to_task_response(db.save_task(task))
+        item.status = data.status
+    return to_item_response(db.save_item(item))
 
 
-@app.delete("/api/v1/tasks/{task_id}", status_code=204)
-def delete_task(task_id: int, user: UserRecord = Depends(get_current_user)):
-    task = db.get_task(task_id)
-    if not task:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Task not found")
-    if task.user_id != user.id:
+# CHANGE 5: DELETE replaced with archive endpoint
+@app.post("/api/v2/items/{item_id}/archive", status_code=204)
+def archive_item(item_id: int, user: UserRecord = Depends(get_current_user)):
+    item = db.get_item(item_id)
+    if not item or item.archived:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Item not found")
+    if item.user_id != user.id:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Forbidden")
-    db.delete_task(task_id)
+    db.archive_item(item_id)
