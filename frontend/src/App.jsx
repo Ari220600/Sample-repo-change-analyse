@@ -1,11 +1,13 @@
 import { useState, useEffect } from 'react'
 
-const API = '/api/v1'
-const token = () => localStorage.getItem('token')
-const headers = () => ({ 'Content-Type': 'application/json', ...(token() ? { Authorization: `Bearer ${token()}` } : {}) })
+const API = '/api/v2'  // CHANGE 1: v1 → v2 prefix
 
 async function api(path, opts = {}) {
-  const res = await fetch(`${API}${path}`, { ...opts, headers: { ...headers(), ...opts.headers } })
+  const token = localStorage.getItem('token')
+  const res = await fetch(`${API}${path}`, {
+    ...opts,
+    headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}), ...opts.headers },
+  })
   if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || res.statusText)
   return res.status === 204 ? null : res.json()
 }
@@ -19,15 +21,11 @@ function AuthForm({ onDone }) {
     e.preventDefault()
     setErr('')
     try {
-      if (mode === 'register') {
-        await api('/auth/register', { method: 'POST', body: JSON.stringify(form) })
-      }
+      if (mode === 'register') await api('/auth/register', { method: 'POST', body: JSON.stringify(form) })
       const { access_token } = await api('/auth/login', { method: 'POST', body: JSON.stringify({ email: form.email, password: form.password }) })
       localStorage.setItem('token', access_token)
       onDone()
-    } catch (ex) {
-      setErr(ex.message)
-    }
+    } catch (ex) { setErr(ex.message) }
   }
 
   return (
@@ -45,17 +43,16 @@ function AuthForm({ onDone }) {
   )
 }
 
-function TaskRow({ task, onUpdate, onDelete }) {
+function ItemRow({ item, onUpdate, onArchive }) {
   return (
-    <div className="row" data-testid={`task-${task.id}`}>
-      <span>{task.title} <small>({task.status})</small></span>
+    <div className="row" data-testid={`item-${item.id}`}>
+      <span>{item.title} <small>({item.status})</small></span>
       <span>
-        <select value={task.status} onChange={(e) => onUpdate(task.id, { status: e.target.value })} aria-label="status">
-          <option value="pending">pending</option>
-          <option value="in_progress">in_progress</option>
-          <option value="completed">completed</option>
+        <select value={item.status} onChange={(e) => onUpdate(item.id, { status: e.target.value })} aria-label="status">
+          <option value="open">open</option>
+          <option value="done">done</option>
         </select>
-        <button onClick={() => onDelete(task.id)}>Delete</button>
+        <button onClick={() => onArchive(item.id)}>Archive</button>
       </span>
     </div>
   )
@@ -63,14 +60,14 @@ function TaskRow({ task, onUpdate, onDelete }) {
 
 function Dashboard() {
   const [user, setUser] = useState(null)
-  const [tasks, setTasks] = useState([])
+  const [items, setItems] = useState([])
   const [stats, setStats] = useState(null)
   const [title, setTitle] = useState('')
 
   const load = async () => {
-    setUser(await api('/users/me'))
-    setTasks(await api('/tasks'))
-    setStats(await api('/tasks/stats'))
+    setUser(await api('/auth/me'))       // CHANGE 3
+    setItems(await api('/items'))        // CHANGE 2
+    setStats(await api('/items/stats'))
   }
 
   useEffect(() => { load().catch(() => { localStorage.removeItem('token'); window.location.reload() }) }, [])
@@ -78,7 +75,7 @@ function Dashboard() {
   const create = async (e) => {
     e.preventDefault()
     if (!title.trim()) return
-    await api('/tasks', { method: 'POST', body: JSON.stringify({ title }) })
+    await api('/items', { method: 'POST', body: JSON.stringify({ title }) })
     setTitle('')
     load()
   }
@@ -86,18 +83,23 @@ function Dashboard() {
   return (
     <div className="wrap">
       <header>
-        <h1>TaskFlow</h1>
+        <h1>TaskFlow v2</h1>
         <span>{user?.username}</span>
         <button onClick={() => { localStorage.removeItem('token'); window.location.reload() }}>Logout</button>
       </header>
-      {stats && <p className="stats">Total: {stats.total} | Pending: {stats.pending} | Done: {stats.completed}</p>}
+      {stats && <p className="stats">Total: {stats.total} | Open: {stats.open} | Done: {stats.done}</p>}
       <form className="card" onSubmit={create}>
-        <input placeholder="New task" value={title} onChange={(e) => setTitle(e.target.value)} />
+        <input placeholder="New item" value={title} onChange={(e) => setTitle(e.target.value)} />
         <button type="submit">Add</button>
       </form>
       <div className="card">
-        {tasks.map((t) => (
-          <TaskRow key={t.id} task={t} onUpdate={(id, d) => api(`/tasks/${id}`, { method: 'PUT', body: JSON.stringify(d) }).then(load)} onDelete={(id) => api(`/tasks/${id}`, { method: 'DELETE' }).then(load)} />
+        {items.map((i) => (
+          <ItemRow
+            key={i.id}
+            item={i}
+            onUpdate={(id, d) => api(`/items/${id}`, { method: 'PATCH', body: JSON.stringify(d) }).then(load)}
+            onArchive={(id) => api(`/items/${id}/archive`, { method: 'POST' }).then(load)}
+          />
         ))}
       </div>
     </div>
@@ -105,6 +107,6 @@ function Dashboard() {
 }
 
 export default function App() {
-  const [loggedIn, setLoggedIn] = useState(!!token())
+  const [loggedIn, setLoggedIn] = useState(!!localStorage.getItem('token'))
   return <div className="wrap">{loggedIn ? <Dashboard /> : <AuthForm onDone={() => setLoggedIn(true)} />}</div>
 }
